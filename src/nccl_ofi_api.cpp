@@ -6,10 +6,13 @@
 #include "config.h"
 
 #include <stdlib.h>
+#include <map>
+#include <utility>
 
 #include "nccl_ofi.h"
 #include "nccl_ofi_api.h"
 #include "nccl_ofi_param.h"
+
 
 
 static_assert(sizeof(nccl_net_ofi_conn_handle_t) <= NCCL_NET_HANDLE_MAXSIZE,
@@ -446,6 +449,9 @@ ncclResult_t nccl_net_ofi_isend(void* sendComm, void* data, size_t size,
 	nccl_net_ofi_mr_handle_t *handle = (nccl_net_ofi_mr_handle_t *)mhandle;
 	nccl_net_ofi_req **base_req = (nccl_net_ofi_req **)request;
 
+	// This will get leaked right now, but I don't care
+	static std::map<void *, std::pair<void *, size_t>> known_buffers;
+
 	/* Validate send_comm */
 	if (OFI_UNLIKELY(send_comm == NULL)) {
 		NCCL_OFI_WARN("Invalid communicator object provided");
@@ -463,7 +469,36 @@ ncclResult_t nccl_net_ofi_isend(void* sendComm, void* data, size_t size,
 		return check_return(ncclInternalError);
 	}
 
+	// put correctness check before the send because otherwise we don't
+	// know for sure what the send saw.
+
+	if (auto it = known_buffers.find(data); it != known_buffers.end()) {
+		if (it->second.second != size) {
+			NCCL_OFI_WARN("Buffer %p with size %zu was previously sent with different size -  previous size: %zu)",
+				      data, it->second.second);
+		}
+		if (size <= it->second.second) {
+			// for LL I care explicitly about 4 byte sized data
+			uint32_t *data_as_u32 = (uint32_t *)data;
+			uint32_t *known_data_as_u32 = (uint32_t *)it->second.first;
+			for (size_t i = 0; i < size / sizeof(uint32_t); i++) {
+				if (data_as_u32[i] == known_data_as_u32[i]) {
+					NCCL_OFI_WARN("Buffer %p with size %zu was previously sent with the same data - previous data: %08x, new data: %08x at index %zu",
+						      data, size, known_data_as_u32[i], data_as_u32[i], i);
+				}
+			}
+		}
+	} else {
+		void *new_data = malloc(size);
+		known_buffers[data] = std::make_pair(new_data, size);
+	}
+
 	int ret = send_comm->send(data, size, tag, handle, base_req);
+
+	if (auto it = known_buffers.find(data); it != known_buffers.end()) {
+		memcpy(it->second.first, data, size);
+	}
+
 	return nccl_net_ofi_retval_translate_impl(ret);
 }
 
