@@ -475,7 +475,7 @@ ncclResult_t nccl_net_ofi_isend(void* sendComm, void* data, size_t size,
 	if (auto it = known_buffers.find(data); it != known_buffers.end()) {
 		if (it->second.second != size) {
 			NCCL_OFI_WARN("Buffer %p with size %zu was previously sent with different size -  previous size: %zu)",
-				      data, it->second.second);
+				      data, size, it->second.second);
 		}
 		if (size <= it->second.second) {
 			// for LL I care explicitly about 4 byte sized data
@@ -483,8 +483,9 @@ ncclResult_t nccl_net_ofi_isend(void* sendComm, void* data, size_t size,
 			uint32_t *known_data_as_u32 = (uint32_t *)it->second.first;
 			for (size_t i = 0; i < size / sizeof(uint32_t); i++) {
 				if (data_as_u32[i] == known_data_as_u32[i]) {
-					NCCL_OFI_WARN("Buffer %p with size %zu was previously sent with the same data - previous data: %08x, new data: %08x at index %zu",
-						      data, size, known_data_as_u32[i], data_as_u32[i], i);
+				    if ( data_as_u32[i] == 0x01010101) continue;
+				    NCCL_OFI_WARN("Buffer %p with size %zu was previously sent with the same data - previous data: %08x, new data: %08x at index %zu",
+						data, size, known_data_as_u32[i], data_as_u32[i], i);
 				}
 			}
 		}
