@@ -483,9 +483,18 @@ ncclResult_t nccl_net_ofi_isend(void* sendComm, void* data, size_t size,
 			uint32_t *known_data_as_u32 = (uint32_t *)it->second.first;
 			for (size_t i = 0; i < size / sizeof(uint32_t); i++) {
 				if (data_as_u32[i] == known_data_as_u32[i]) {
+				    // This value gets passed around during init, so ignore it
 				    if ( data_as_u32[i] == 0x01010101) continue;
-				    NCCL_OFI_WARN("Buffer %p with size %zu was previously sent with the same data - previous data: %08x, new data: %08x at index %zu",
-						data, size, known_data_as_u32[i], data_as_u32[i], i);
+
+                    // This branch is for LL data. We print the flag as well.
+				    if ( i < size / sizeof(uint32_t) - 1) {
+				        NCCL_OFI_WARN("Buffer %p with size %zu was previously sent with the same data - index: %zu, data: %08x, new flag: %08x, previous flag: %08x",
+						      data, size, i, data_as_u32[i], data_as_u32[i+1], known_data_as_u32[i+1]);
+				    } else {
+                      // We should never hit this branch with LL data, but it's here for safety just in case
+				        NCCL_OFI_WARN("Buffer %p with size %zu was previously sent with the same data - index: %zu, data: %08x, end of buffer",
+						      data, size, i, data_as_u32[i]);
+                    }
 				}
 			}
 		}
