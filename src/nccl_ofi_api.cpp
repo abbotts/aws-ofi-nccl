@@ -440,6 +440,10 @@ ncclResult_t nccl_net_ofi_deregMr(void *comm, void *mhandle)
 	return nccl_net_ofi_retval_translate_impl(ret);
 }
 
+static std::map<void *,void *> request_map;
+
+// This will get leaked right now, but I don't care
+static std::map<void *, std::pair<void *, size_t>> known_buffers;
 
 ncclResult_t nccl_net_ofi_isend(void* sendComm, void* data, size_t size,
 				int tag, void* mhandle, void** request)
@@ -448,9 +452,6 @@ ncclResult_t nccl_net_ofi_isend(void* sendComm, void* data, size_t size,
 		(nccl_net_ofi_send_comm *)sendComm;
 	nccl_net_ofi_mr_handle_t *handle = (nccl_net_ofi_mr_handle_t *)mhandle;
 	nccl_net_ofi_req **base_req = (nccl_net_ofi_req **)request;
-
-	// This will get leaked right now, but I don't care
-	static std::map<void *, std::pair<void *, size_t>> known_buffers;
 
 	/* Validate send_comm */
 	if (OFI_UNLIKELY(send_comm == NULL)) {
@@ -504,6 +505,10 @@ ncclResult_t nccl_net_ofi_isend(void* sendComm, void* data, size_t size,
 	}
 
 	int ret = send_comm->send(data, size, tag, handle, base_req);
+	// Add request to the map, so long as the return was 0
+	if (ret == 0) {
+		request_map[*request] = data;
+	}
 
 	if (auto it = known_buffers.find(data); it != known_buffers.end()) {
 		memcpy(it->second.first, data, size);
@@ -575,6 +580,30 @@ ncclResult_t nccl_net_ofi_test(void* req, int* done, int* size)
 
 	nccl_net_ofi_req *base_req = (nccl_net_ofi_req *)req;
 	int ret = base_req->test(done, size);
+	
+	// Test if request completed
+	if (*done == 1) {
+		
+		// Find the buffer associated with the request, and compare it against the known buffer for that address, if it exists. 
+		if (auto it = request_map.find(req); it != request_map.end()) {
+			
+			void *data = it->second;
+			
+			if (auto known_it = known_buffers.find(data); known_it != known_buffers.end()) {			
+				uint32_t *data_as_u32 = (uint32_t *)data;
+				uint32_t *known_data_as_u32 = (uint32_t *)known_it->second.first;
+			
+				for (size_t i = 0; i < size / sizeof(uint32_t); i++) {
+					if (data_as_u32[i] != known_data_as_u32[i]) {
+				        NCCL_OFI_WARN("Buffer %p with size %zu has different data at request completion - index: %zu, new data: %08x, old data: %08x",
+						      data, size, i, data_as_u32[i], known_data_as_u32[i]);
+					}
+				}
+			}
+		}
+		// Erase the request from the map, since it's completed
+		request_map.erase(req);
+	}
 	return nccl_net_ofi_retval_translate_impl(ret);
 }
 
