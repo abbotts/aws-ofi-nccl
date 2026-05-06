@@ -649,9 +649,9 @@ ncclResult_t nccl_net_ofi_iflush(void* rComm, int n, void** buffers, int* sizes,
 
 	int ret = recv_comm->flush(n, buffers, sizes, handles, base_req);
 
-	for (int i = 0; i < n; i++) {
-		void *data = buffers[i];
-		size_t size = sizes[i];
+	for (int ib = 0; ib < n; ib++) {
+		void *data = buffers[ib];
+		size_t size = sizes[ib];
 		if (auto it = flush_buffers.find(data); it != flush_buffers.end()) {
 			if (it->second.second != size) {
 				NCCL_OFI_WARN("Buffer %p with size %zu was previously received with different size -  previous size: %zu)",
