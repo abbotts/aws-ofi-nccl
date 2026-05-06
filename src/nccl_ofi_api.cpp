@@ -610,6 +610,7 @@ ncclResult_t nccl_net_ofi_test(void* req, int* done, int* size)
 	return nccl_net_ofi_retval_translate_impl(ret);
 }
 
+static std::map<void *, std::pair<void *, size_t>> flush_buffers;
 
 ncclResult_t nccl_net_ofi_iflush(void* rComm, int n, void** buffers, int* sizes,
 				 void** mhandles, void** req)
@@ -647,6 +648,45 @@ ncclResult_t nccl_net_ofi_iflush(void* rComm, int n, void** buffers, int* sizes,
 	}
 
 	int ret = recv_comm->flush(n, buffers, sizes, handles, base_req);
+
+	for (int i = 0; i < n; i++) {
+		void *data = buffers[i];
+		size_t size = sizes[i];
+		if (auto it = flush_buffers.find(data); it != flush_buffers.end()) {
+			if (it->second.second != size) {
+				NCCL_OFI_WARN("Buffer %p with size %zu was previously received with different size -  previous size: %zu)",
+					      data, size, it->second.second);
+			}	
+			if (size <= it->second.second) {
+				// for LL I care explicitly about 4 byte sized data
+				uint32_t *data_as_u32 = (uint32_t *)data;
+				uint32_t *known_data_as_u32 = (uint32_t *)it->second.first;
+				for (size_t i = 0; i < size / sizeof(uint32_t); i++) {
+					if (data_as_u32[i] == known_data_as_u32[i]) {
+				    	// This value gets passed around during init, so ignore it
+				    	if ( data_as_u32[i] == 0x01010101) continue;
+
+                    	// This branch is for LL data. We print the flag as well.
+				    	if ( i < size / sizeof(uint32_t) - 1) {
+				        	NCCL_OFI_WARN("Buffer %p with size %zu was previously recieved with the same data - index: %zu, data: %08x, new flag: %08x, previous flag: %08x",
+						    	  data, size, i, data_as_u32[i], data_as_u32[i+1], known_data_as_u32[i+1]);
+				    	} else {
+                      		// We should never hit this branch with LL data, but it's here for safety just in case
+				        	NCCL_OFI_WARN("Buffer %p with size %zu was previously recieved with the same data - index: %zu, data: %08x, end of buffer",
+						    	  data, size, i, data_as_u32[i]);
+                    	}
+					}
+				}
+			}
+		} else {
+			void *new_data = malloc(size);
+			flush_buffers[data] = std::make_pair(new_data, size);
+		}
+		
+		memcpy(flush_buffers[data].first, data, size);
+
+	}
+
 	return nccl_net_ofi_retval_translate_impl(ret);
 }
 
