@@ -570,11 +570,15 @@ ncclResult_t nccl_net_ofi_irecv(void* recvComm, int n, void** data,
 	return nccl_net_ofi_retval_translate_impl(ret);
 }
 
+// The flush is also async, so we need to add buffers to the list in flush and then check for the flush completion, and
+// duplicate data, in test.
+static std::map<void *, std::pair<void *, size_t>> flush_buffers;
+static std::map<void *, std::pair<void *, size_t>> flush_request_map;
 
 ncclResult_t nccl_net_ofi_test(void* req, int* done, int* size)
 {
 	/* Validate request */
-	if (OFI_UNLIKELY(req == NULL)) {
+	if (OFI_UNLIKELY(req == NULL || done == NULL)) {
 		return check_return(ncclInternalError);
 	}
 
@@ -603,14 +607,60 @@ ncclResult_t nccl_net_ofi_test(void* req, int* done, int* size)
                     }
                 }
 			}
+			// Erase the request from the map, since it's completed
+			request_map.erase(req);
 		}
-		// Erase the request from the map, since it's completed
-		request_map.erase(req);
 	}
+
+	// Do the same type of check, but for flushes. We want to check the buffer for the flush against the known buffer for that address, if it exists, at flush completion.
+	// In the case of flushes, we want to check if the data is the same as the last time this buffer was flushed
+
+	if (*done == 1) {
+		if (auto it = flush_request_map.find(req); it != flush_request_map.end()) {
+
+			void *data = it->second.first;
+			size_t flush_size = it->second.second;
+			if (auto known_it = flush_buffers.find(data); known_it != flush_buffers.end()) {	
+				if (known_it->second.second != flush_size) {
+					NCCL_OFI_WARN("Buffer %p with size %zu was previously received with different size -  previous size: %zu)",
+						      data, flush_size, known_it->second.second);
+				}	
+				if (flush_size <= known_it->second.second) {
+					// for LL I care explicitly about 4 byte sized data
+					uint32_t *data_as_u32 = (uint32_t *)data;
+					uint32_t *known_data_as_u32 = (uint32_t *)known_it->second.first;
+					for (size_t i = 0; i < flush_size / sizeof(uint32_t); i++) {
+						if (data_as_u32[i] == known_data_as_u32[i]) {
+				    		// This value gets passed around during init, so ignore it
+				    		if ( data_as_u32[i] == 0x01010101) continue;
+
+                    		// This branch is for LL data. We print the flag as well.
+			    		if ( i < flush_size / sizeof(uint32_t) - 1) {
+				        		NCCL_OFI_WARN("Buffer %p with size %zu was previously flushed with the same data - index: %zu, data: %08x, new flag: %08x, previous flag: %08x",
+					      		data, flush_size, i, data_as_u32[i], data_as_u32[i+1], known_data_as_u32[i+1]);
+				     		} else {
+                      			// We should never hit this branch with LL data, but it's here for safety just in case
+				        		NCCL_OFI_WARN("Buffer %p with size %zu was previously flushed with the same data - index: %zu, data: %08x, end of buffer",
+					      		data, flush_size, i, data_as_u32[i]);
+                    		}
+						}
+					}
+				}
+			}
+			else {
+				void *new_data = malloc(flush_size);
+				flush_buffers[data] = std::make_pair(new_data, flush_size);
+			}
+			memcpy(flush_buffers[data].first, data, flush_size);
+			
+			// Erase the request from the map, since it's completed
+			flush_request_map.erase(req);
+		}
+	}
+
 	return nccl_net_ofi_retval_translate_impl(ret);
 }
 
-static std::map<void *, std::pair<void *, size_t>> flush_buffers;
 
 ncclResult_t nccl_net_ofi_iflush(void* rComm, int n, void** buffers, int* sizes,
 				 void** mhandles, void** req)
@@ -628,6 +678,11 @@ ncclResult_t nccl_net_ofi_iflush(void* rComm, int n, void** buffers, int* sizes,
 	if (OFI_UNLIKELY(n > NCCL_OFI_MAX_RECVS)) {
 		NCCL_OFI_WARN("Request for group flush size of %d, greater than maximum of %d",
 			      n, NCCL_OFI_MAX_RECVS);
+		return check_return(ncclInternalError);
+	}
+
+	if (OFI_UNLIKELY(buffers == NULL || sizes == NULL)) {
+		NCCL_OFI_WARN("Invalid buffer or size array provided");
 		return check_return(ncclInternalError);
 	}
 
@@ -650,6 +705,12 @@ ncclResult_t nccl_net_ofi_iflush(void* rComm, int n, void** buffers, int* sizes,
 	int ret = recv_comm->flush(n, buffers, sizes, handles, base_req);
 
 	for (int ib = 0; ib < n; ib++) {
+		// If the request is not null, add it to the flush request map, so we can check the buffer against the known buffer for that address at flush completion in test.
+		if (base_req[ib] != nullptr) {
+			flush_request_map[base_req[ib]] = std::make_pair(buffers[ib], sizes[ib]);
+			continue;
+		}
+
 		void *data = buffers[ib];
 		size_t size = sizes[ib];
 		if (auto it = flush_buffers.find(data); it != flush_buffers.end()) {
@@ -668,11 +729,11 @@ ncclResult_t nccl_net_ofi_iflush(void* rComm, int n, void** buffers, int* sizes,
 
                     	// This branch is for LL data. We print the flag as well.
 				    	if ( i < size / sizeof(uint32_t) - 1) {
-				        	NCCL_OFI_WARN("Buffer %p with size %zu was previously recieved with the same data - index: %zu, data: %08x, new flag: %08x, previous flag: %08x",
+				        	NCCL_OFI_WARN("Buffer %p with size %zu was previously flushed with the same data - index: %zu, data: %08x, new flag: %08x, previous flag: %08x",
 						    	  data, size, i, data_as_u32[i], data_as_u32[i+1], known_data_as_u32[i+1]);
 				    	} else {
                       		// We should never hit this branch with LL data, but it's here for safety just in case
-				        	NCCL_OFI_WARN("Buffer %p with size %zu was previously recieved with the same data - index: %zu, data: %08x, end of buffer",
+				        	NCCL_OFI_WARN("Buffer %p with size %zu was previously flushed with the same data - index: %zu, data: %08x, end of buffer",
 						    	  data, size, i, data_as_u32[i]);
                     	}
 					}
